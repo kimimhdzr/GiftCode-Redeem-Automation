@@ -7,7 +7,6 @@ from redeemer import redeem_code_for_all_players
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 API_URL          = "https://kingshot.net/api/gift-codes"
-PLAYER_IDS_FILE  = "playerIDs.txt"
 
 # Load Supabase credentials from environment variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -36,21 +35,18 @@ log = logging.getLogger(__name__)
 
 
 def load_player_ids() -> list:
-    """Read player IDs from playerIDs.txt (one ID per line, optional name after space)."""
-    players = []
-    if not os.path.exists(PLAYER_IDS_FILE):
-        log.error(f"'{PLAYER_IDS_FILE}' not found! Please create it.")
-        return players
-    with open(PLAYER_IDS_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split(maxsplit=1)
-            pid  = parts[0]
-            name = parts[1] if len(parts) > 1 else pid
-            players.append((pid, name))
-    return players
+    """Fetch active players dynamically from the Supabase database."""
+    try:
+        response = supabase.table("players") \
+            .select("player_id", "player_name") \
+            .eq("is_active", True) \
+            .execute()
+        
+        # Format matching your original structure: [(pid, name), ...]
+        return [(str(row["player_id"]), row["player_name"] or str(row["player_id"])) for row in response.data]
+    except Exception as e:
+        log.error(f"Failed to fetch player IDs from Supabase: {e}")
+        return []
 
 
 def fetch_active_codes() -> list:
@@ -144,9 +140,9 @@ def check_and_redeem():
 
 def main():
     log.info("╔══════════════════════════════════════╗")
-    log.info("║  KingShot Auto Gift Code Redeemer    ║")
+    log.info("║   KingShot Auto Gift Code Redeemer   ║")
     log.info("╚══════════════════════════════════════╝")
-    log.info(f"Player file : {PLAYER_IDS_FILE}")
+    log.info("Player Info : Dynamic Supabase 'players' Table")
     log.info("Storage Env : Supabase Cloud Backend")
 
     check_and_redeem()
