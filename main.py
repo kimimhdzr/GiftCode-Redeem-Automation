@@ -1,27 +1,23 @@
-"""
-KingShot Auto Gift Code Redeemer
----------------------------------
-Polls kingshot.net/api/gift-codes every 15 minutes.
-When a NEW code is detected, automatically redeems it
-for every player in playerIDs.txt.
-
-Author: Built by Gopi
-"""
-
-import time
-import json
 import os
-import requests
-import schedule
 import logging
+import requests
 from datetime import datetime
+from supabase import create_client, Client
 from redeemer import redeem_code_for_all_players
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 API_URL          = "https://kingshot.net/api/gift-codes"
 PLAYER_IDS_FILE  = "playerIDs.txt"
-SEEN_CODES_FILE  = "seen_codes.json"   # Tracks codes we've already processed
-CHECK_INTERVAL   = 15                  # How often to poll the API (minutes)
+
+# Load Supabase credentials from environment variables
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY environment variables!")
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ───────────────────────────────────────────────────────────────────────────────
 
 # Set up logging to both console and file
@@ -37,21 +33,6 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
-
-
-def load_seen_codes() -> set:
-    """Load the set of gift code strings we've already processed."""
-    if not os.path.exists(SEEN_CODES_FILE):
-        return set()
-    with open(SEEN_CODES_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return set(data.get("redeemed", []))
-
-
-def save_seen_codes(codes: set):
-    """Persist the set of processed codes to disk."""
-    with open(SEEN_CODES_FILE, "w", encoding="utf-8") as f:
-        json.dump({"redeemed": list(codes)}, f, indent=2)
 
 
 def load_player_ids() -> list:
@@ -85,8 +66,37 @@ def fetch_active_codes() -> list:
         return []
 
 
+def get_already_redeemed_pids(code: str) -> set:
+    """Fetch all player IDs from Supabase who already redeemed this specific code."""
+    try:
+        response = supabase.table("redeemed_history") \
+            .select("player_id") \
+            .eq("gift_code", code) \
+            .execute()
+        return {row["player_id"] for row in response.data}
+    except Exception as e:
+        log.error(f"Failed to fetch tracking history from Supabase: {e}")
+        return set()
+
+
+def record_successful_redemptions(code: str, successful_pids: list):
+    """Save the newly successful redemptions directly into the Supabase database."""
+    if not successful_pids:
+        return
+    
+    data_to_insert = [
+        {"gift_code": code, "player_id": pid} for pid in successful_pids
+    ]
+    
+    try:
+        supabase.table("redeemed_history").insert(data_to_insert).execute()
+        log.info(f"Successfully recorded {len(successful_pids)} entries to Supabase cloud.")
+    except Exception as e:
+        log.error(f"Failed to write redemptions to Supabase: {e}")
+
+
 def check_and_redeem():
-    """Core job: check for new codes and redeem them."""
+    """Core job: check for new codes and redeem them using granular cloud tracking."""
     log.info("─── Checking for new gift codes ───")
 
     active_codes = fetch_active_codes()
@@ -96,30 +106,38 @@ def check_and_redeem():
 
     log.info(f"API returned {len(active_codes)} active code(s): {active_codes}")
 
-    seen_codes  = load_seen_codes()
-    new_codes   = [c for c in active_codes if c not in seen_codes]
-
-    if not new_codes:
-        log.info("No new codes found. Nothing to redeem.")
-        return
-
-    log.info(f"🎁 NEW code(s) detected: {new_codes}")
-
     player_ids = load_player_ids()
     if not player_ids:
         log.warning("No player IDs loaded — skipping redemption.")
         return
 
-    log.info(f"Loaded {len(player_ids)} players.")
+    log.info(f"Loaded {len(player_ids)} total target players from config.")
 
-    for code in new_codes:
+    for code in active_codes:
+        # Check database per code to see who has already claimed it
+        used_pids = get_already_redeemed_pids(code)
+
+        # Only process players whose IDs are missing from Supabase for this code
+        players_to_redeem = [
+            (pid, name) for pid, name in player_ids 
+            if pid not in used_pids
+        ]
+
+        if not players_to_redeem:
+            log.info(f"Code [{code}]: Already processed for all active players.")
+            continue
+
         log.info(f"\n{'='*50}")
-        log.info(f"  Redeeming code: {code}")
+        log.info(f"🎁 Processing code [{code}] for {len(players_to_redeem)} pending player(s)...")
         log.info(f"{'='*50}")
-        redeem_code_for_all_players(code, player_ids, log)
-        seen_codes.add(code)
-        save_seen_codes(seen_codes)
-        log.info(f"✅ Finished processing code: {code}")
+        
+        # Execute Selenium orchestration
+        successful_pids = redeem_code_for_all_players(code, players_to_redeem, log)
+        
+        # Save winners to Supabase database context
+        record_successful_redemptions(code, successful_pids)
+            
+        log.info(f"✅ Finished processing code cycle: {code}")
 
     log.info("─── Check complete ───\n")
 
@@ -128,17 +146,10 @@ def main():
     log.info("╔══════════════════════════════════════╗")
     log.info("║  KingShot Auto Gift Code Redeemer    ║")
     log.info("╚══════════════════════════════════════╝")
-    log.info(f"Polling every {CHECK_INTERVAL} minutes.")
     log.info(f"Player file : {PLAYER_IDS_FILE}")
-    log.info(f"Seen codes  : {SEEN_CODES_FILE}")
+    log.info("Storage Env : Supabase Cloud Backend")
 
-    # Run once immediately on startup, then on schedule
     check_and_redeem()
-    schedule.every(CHECK_INTERVAL).minutes.do(check_and_redeem)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
 
 
 if __name__ == "__main__":
